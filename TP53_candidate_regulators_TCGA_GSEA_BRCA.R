@@ -7,7 +7,7 @@
 #      - 讀取 read counts (data_mrna_seq_read_counts.txt)
 #      - 判定 TP53 mutation status (data_mutations.txt)
 #      - TP53 Mutant vs Wild Type 差異表現與 GSEA 分析
-#      - 針對 21 個 candidate genes 執行 limma 差異表現分析 與 GSEA (僅 TP53 WT)
+#      - 針對 144 個 candidate genes 執行 limma 差異表現分析 與 GSEA (僅 TP53 WT)
 #      - 統整各個 Gene Set 的 GSEA 結果
 #
 # 輸出至各自的 [dataset]_results_limma_[gene_list]/ 資料夾
@@ -42,7 +42,7 @@ datasets_to_run <- c(
 # datasets_to_run <- c("brca_tcga_gdc")
 
 # 讀取 Candidate Genes
-target_genes_file <- "COPS6.csv"
+target_genes_file <- "p53_candidate_regulators_144_genes.csv"
 if (!file.exists(target_genes_file)) {
   stop(sprintf("找不到目標基因名單檔案: %s", target_genes_file))
 }
@@ -451,6 +451,7 @@ for (dataset_dir in datasets_to_run) {
       cat(sprintf("  -> 已輸出 %s 的統整結果至: %s\n", pw, out_file))
     }
   }
+
   
   # ---- 3.7 分析摘要 (針對個別 Dataset) ----
   cat("\n================================================================\n")
@@ -467,3 +468,176 @@ for (dataset_dir in datasets_to_run) {
 cat("\n\n################################################################\n")
 cat("### 所有選定之 Dataset 分析完成! ###\n")
 cat("################################################################\n")
+
+# ==============================================================================
+# ---- 4. 尋找共同顯著基因: NES > 1.5 & padj < 0.05 交集分析 (獨立執行區塊) ----
+# ==============================================================================
+
+cat("\n\n################################################################\n")
+cat("### 開始針對各 Dataset 進行交集分析 ###\n")
+cat("################################################################\n")
+
+for (dataset_dir in datasets_to_run) {
+  dataset_prefix <- sub("_tcga_gdc$", "", dataset_dir)
+  output_dir <- sprintf("%s_results_limma_%s", dataset_prefix, target_genes_file_base)
+  summary_dir <- file.path(output_dir, "GSEA_Summary_by_GeneSet")
+  
+  if (!dir.exists(summary_dir)) {
+    cat(sprintf("\n!!警告: 找不到 %s 的統整資料夾 (%s)，跳過此 dataset 的交集分析。\n", dataset_dir, summary_dir))
+    next
+  }
+  
+  cat(sprintf("\n=== [%s] 顯著候選基因交集分析 ===\n", dataset_dir))
+  
+  target_summary_files <- c(
+    "p53_direct_target_genes_Fischer_2017" = "GSEA_summary_p53_direct_target_genes_Fischer_2017.csv",
+    "FISCHER_DIRECT" = "GSEA_summary_FISCHER_DIRECT_P53_TARGETS_META_ANALYSIS.csv",
+    "HALLMARK_P53" = "GSEA_summary_HALLMARK_P53_PATHWAY.csv"
+  )
+  
+  sig_genes_list <- list()
+  
+  for (set_name in names(target_summary_files)) {
+    file_path <- file.path(summary_dir, target_summary_files[[set_name]])
+    if (file.exists(file_path)) {
+      df <- read.csv(file_path, stringsAsFactors = FALSE)
+      
+      # 確保轉為數值後篩選: NES > 1.5 且 padj < 0.05
+      valid_rows <- !is.na(df$NES) & !is.na(df$padj) & 
+                    (as.numeric(df$NES) > 1.5) & 
+                    (as.numeric(df$padj) < 0.05)
+      sig_df <- df[valid_rows, ]
+      
+      sig_genes_list[[set_name]] <- sig_df$Target_Gene
+      cat(sprintf("  [%s] 符合條件之基因數: %d\n", set_name, length(sig_genes_list[[set_name]])))
+    } else {
+      cat(sprintf("  !!警告: 找不到檔案 %s，請確認該 Gene Set 有成功統整。\n", target_summary_files[[set_name]]))
+      sig_genes_list[[set_name]] <- character(0)
+    }
+  }
+  
+  # 取交集
+  if (length(sig_genes_list) == 3) {
+    intersect_genes <- Reduce(intersect, sig_genes_list)
+    cat(sprintf("  -> 三個 Gene Sets 皆符合條件的交集基因數: %d\n", length(intersect_genes)))
+    
+    intersect_df <- data.frame(Target_Gene = intersect_genes, stringsAsFactors = FALSE)
+    intersect_out_file <- file.path(summary_dir, "Intersection_Significant_Target_Genes.csv")
+    write.csv(intersect_df, intersect_out_file, row.names = FALSE)
+    cat(sprintf("  -> 交集結果已輸出至: %s\n", intersect_out_file))
+  } else {
+    cat("  未能成功載入三個指定的 Gene Sets，略過交集分析。\n")
+  }
+}
+cat("\n=== 所有 Dataset 交集分析完成 ===\n")
+
+# ==============================================================================
+# ---- 5. 跨 Dataset 統整: Intersection_Significant_Target_Genes 交集結果彙整 獨立執行區塊 ----
+# ==============================================================================
+cat("\n\n################################################################\n")
+cat("### 開始進行跨 Dataset 的顯著基因交集結果彙整 ###\n")
+cat("################################################################\n")
+
+cross_dataset_list <- list()
+
+for (dataset_dir in datasets_to_run) {
+  dataset_prefix <- sub("_tcga_gdc$", "", dataset_dir)
+  output_dir <- sprintf("%s_results_limma_%s", dataset_prefix, target_genes_file_base)
+  summary_dir <- file.path(output_dir, "GSEA_Summary_by_GeneSet")
+  intersect_file <- file.path(summary_dir, "Intersection_Significant_Target_Genes.csv")
+  
+  if (file.exists(intersect_file)) {
+    intersect_df <- read.csv(intersect_file, stringsAsFactors = FALSE)
+    if (nrow(intersect_df) > 0) {
+      for (gene in intersect_df$Target_Gene) {
+        if (is.null(cross_dataset_list[[gene]])) {
+          cross_dataset_list[[gene]] <- c(toupper(dataset_prefix))
+        } else {
+          cross_dataset_list[[gene]] <- c(cross_dataset_list[[gene]], toupper(dataset_prefix))
+        }
+      }
+    }
+  } else {
+    cat(sprintf("  !!警告: 找不到 %s 的交集結果檔案，跳過此 dataset。\n", dataset_dir))
+  }
+}
+
+if (length(cross_dataset_list) > 0) {
+  cross_summary_df <- data.frame(
+    Target_Gene = names(cross_dataset_list),
+    Total_Count = sapply(cross_dataset_list, length),
+    Datasets = sapply(cross_dataset_list, function(x) paste(x, collapse = ", ")),
+    stringsAsFactors = FALSE
+  )
+  
+  # 加入 Category 欄位 (對應回 target_genes_file)
+  if ("Category" %in% colnames(candidate_genes_df)) {
+    category_map <- setNames(candidate_genes_df$Category, candidate_genes_df$Gene_name)
+    cross_summary_df$Category <- category_map[cross_summary_df$Target_Gene]
+    
+    # 重新排列欄位順序
+    cross_summary_df <- cross_summary_df[, c("Target_Gene", "Category", "Total_Count", "Datasets")]
+  }
+  
+  # 依據出現次數由大到小排序
+  cross_summary_df <- cross_summary_df[order(cross_summary_df$Total_Count, decreasing = TRUE), ]
+  
+  cross_out_file <- sprintf("Cross_Dataset_Intersection_Summary_%s.csv", target_genes_file_base)
+  write.csv(cross_summary_df, cross_out_file, row.names = FALSE)
+  cat(sprintf("\n-> 跨 Dataset 統整結果已輸出至: %s\n", cross_out_file))
+} else {
+  cat("\n-> 沒有在任何 Dataset 中找到符合條件的顯著基因。\n")
+}
+cat("\n=== 跨 Dataset 統整完成 ===\n")
+
+# ==============================================================================
+# ---- 6. 跨 Dataset 統整: TP53 Mutant vs WT GSEA 結果彙整 獨立執行區塊 ----
+# ==============================================================================
+cat("\n\n################################################################\n")
+cat("### 開始進行跨 Dataset 的 TP53 Mutant vs WT GSEA 結果彙整 ###\n")
+cat("################################################################\n")
+
+gsea_mt_wt_list <- list()
+
+for (dataset_dir in datasets_to_run) {
+  dataset_prefix <- sub("_tcga_gdc$", "", dataset_dir)
+  output_dir <- sprintf("%s_results_limma_%s", dataset_prefix, target_genes_file_base)
+  out_dir_mt_vs_wt <- file.path(output_dir, sprintf("%s_TP53_mt_vs_wt", dataset_prefix))
+  
+  gsea_res_file <- file.path(out_dir_mt_vs_wt, "GSEA_TP53_mutant_vs_wt_Unified_GeneSets_results.csv")
+  
+  if (file.exists(gsea_res_file)) {
+    df <- read.csv(gsea_res_file, stringsAsFactors = FALSE)
+    if (nrow(df) > 0) {
+      req_cols <- c("pathway", "pval", "padj", "log2err", "ES", "NES", "size", "leadingEdge")
+      avail_cols <- intersect(req_cols, colnames(df))
+      
+      if (length(avail_cols) > 0) {
+        df_sub <- df[, avail_cols, drop = FALSE]
+        dataset_name_upper <- toupper(dataset_prefix)
+        df_sub$Dataset <- dataset_name_upper
+        
+        # 重新排列欄位，將 Dataset 放在最前面
+        df_sub <- df_sub[, c("Dataset", avail_cols)]
+        
+        gsea_mt_wt_list[[dataset_name_upper]] <- df_sub
+      }
+    }
+  } else {
+    cat(sprintf("  !!警告: 找不到 %s 的 TP53_mt_vs_wt GSEA 結果檔案，跳過此 dataset。\n", dataset_dir))
+  }
+}
+
+if (length(gsea_mt_wt_list) > 0) {
+  cross_gsea_mt_wt_df <- do.call(rbind, gsea_mt_wt_list)
+  
+  # 依據 pathway 排序，方便同一個 pathway 在各 dataset 中比較
+  cross_gsea_mt_wt_df <- cross_gsea_mt_wt_df[order(cross_gsea_mt_wt_df$pathway, cross_gsea_mt_wt_df$Dataset), ]
+  
+  cross_gsea_out_file <- sprintf("Cross_Dataset_TP53_mt_vs_wt_GSEA_Summary_%s.csv", target_genes_file_base)
+  write.csv(cross_gsea_mt_wt_df, cross_gsea_out_file, row.names = FALSE)
+  cat(sprintf("\n-> 跨 Dataset TP53 Mutant vs WT GSEA 統整結果已輸出至: %s\n", cross_gsea_out_file))
+} else {
+  cat("\n-> 沒有在任何 Dataset 中找到符合的 TP53 Mutant vs WT GSEA 結果。\n")
+}
+cat("\n=== 跨 Dataset TP53 Mutant vs WT GSEA 統整完成 ===\n")
